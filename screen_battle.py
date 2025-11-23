@@ -124,7 +124,7 @@ class BattleScreen(BaseScreen):
             bg=COL_BTN,
             fg=COL_BTN_TEXT,
             relief="flat",
-            command=back_lobby
+            command=self._leave_room
         ).place(
             relx=0.5,
             rely=0.92,
@@ -132,6 +132,7 @@ class BattleScreen(BaseScreen):
             width=160,
             height=36
         )
+
 
         # ====== Đăng ký nhận sự kiện từ server ======
         c = master.client
@@ -434,3 +435,13 @@ class BattleScreen(BaseScreen):
             )
 
         self.chat_box.see("end")
+    # ✅ Hàm rời phòng: báo server trừ số người / xóa phòng nếu trống
+    def _leave_room(self):
+        try:
+            # Báo server là mình đã rời phòng
+            self.master.client.send({"type": "LEAVE_ROOM"})
+        except:
+            pass
+
+        # Quay về Lobby như cũ
+        self.master._show_lobby()

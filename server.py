@@ -55,6 +55,23 @@ def broadcast(room_id, data):
         send(p, data)
 
 
+# ===== CẬP NHẬT DANH SÁCH PHÒNG CHO TẤT CẢ CLIENT (LOBBY) =====
+def broadcast_rooms():
+    room_list = []
+    for rid, r in rooms.items():
+        room_list.append({
+            "id": rid,
+            "players": len(r["players"]),
+            "owner": r.get("owner", "Unknown")
+        })
+
+    for sock in list(clients.keys()):
+        send(sock, {
+            "type": "ROOM_LIST",
+            "rooms": room_list
+        })
+
+
 # ===================== CẬP NHẬT TÊN REALTIME =====================
 def update_names(room_id):
     """Gửi NAME_UPDATE để 2 bên thấy tên nhau realtime."""
@@ -233,6 +250,7 @@ def handle_client(sock):
         leave_room(sock)
         if sock in clients:
             del clients[sock]
+        # broadcast_rooms() không bắt buộc ở đây vì leave_room đã gọi
         sock.close()
 
 
@@ -249,22 +267,48 @@ def leave_room(sock):
 
     with lock:
         r = rooms[room_id]
+
+        # Xóa người chơi khỏi phòng
         if sock in r["players"]:
             r["players"].remove(sock)
 
-        # Nếu hết người -> xoá phòng luôn
+        # Reset cho client
+        clients[sock]["room"] = None
+
+        # ========= NẾU PHÒNG TRỐNG → XÓA =========
         if not r["players"]:
             del rooms[room_id]
-        else:
-            # Cập nhật lại room trong clients
-            clients[sock]["room"] = None
-            # Thông báo cho người còn lại
-            broadcast(room_id, {
-                "type": "CHAT",
-                "msg": "💤 Đối thủ đã rời phòng."
-            })
-            # Cập nhật lại danh sách tên
-            update_names(room_id)
+
+            print(f"🧹 Phòng {room_id} đã bị xóa")
+            print("ROOMS HIỆN TẠI:", {k: len(v['players']) for k, v in rooms.items()})
+
+            # Cập nhật lobby
+            broadcast_rooms()
+            return
+
+        # ========= NẾU CÒN 1 NGƯỜI =========
+        r["stage"] = "waiting"
+        r["ready"] = {}
+        r["boards"] = {}
+        r["shots"] = {}
+        r["stats"] = {}
+        r["turn"] = None
+        r["replay_requests"] = set()
+        r["start_time"] = None
+
+        remain = r["players"][0]
+
+        send(remain, {
+            "type": "CHAT",
+            "msg": "⚠ Đối thủ đã rời phòng."
+        })
+
+        update_names(room_id)
+
+        print("ROOMS SAU KHI RỜI:", {k: len(v['players']) for k, v in rooms.items()})
+
+        # Cập nhật lobby
+        broadcast_rooms()
 
 
 # ===================== XỬ LÝ GÓI TIN =====================
@@ -321,6 +365,9 @@ def process(sock, msg):
             "owner": owner
         })
 
+        # cập nhật lobby sau khi tạo phòng
+        broadcast_rooms()
+
     # ---------- JOIN_ROOM ----------
     elif t == "JOIN_ROOM":
         rid = msg.get("room")
@@ -359,6 +406,9 @@ def process(sock, msg):
             })
 
             update_names(rid)
+
+        # cập nhật lobby sau khi có người join
+        broadcast_rooms()
 
     # ---------- LEAVE_ROOM (tự rời phòng nhưng vẫn online) ----------
     elif t == "LEAVE_ROOM":
