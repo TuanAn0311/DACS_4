@@ -61,6 +61,8 @@ class LoginScreen(BaseScreen):
         return e
 
 
+    # [Trong file screen_login.py]
+
     # ================== LOGIN PLAYER ==================
     def login_player(self):
         username = self.user.get().strip()
@@ -74,8 +76,11 @@ class LoginScreen(BaseScreen):
 
         if ok:
             self.master.username = username
+            
+            # --- THÊM DÒNG NÀY ---
+            self.master.is_admin = False  # Đánh dấu đây là người chơi thường
+            # ---------------------
 
-            # ✅ GỬI TÊN LÊN SERVER
             if hasattr(self.master, "client"):
                 self.master.client.set_name(username)
 
@@ -98,6 +103,10 @@ class LoginScreen(BaseScreen):
 
         if ok:
             self.master.username = username
+            
+            # --- THÊM DÒNG NÀY ---
+            self.master.is_admin = True   # Đánh dấu đây là Admin
+            # ---------------------
 
             if hasattr(self.master, "client"):
                 self.master.client.set_name(username)

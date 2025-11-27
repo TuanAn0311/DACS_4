@@ -4,35 +4,14 @@ import threading
 import json
 import random
 from datetime import datetime
-from db import get_connection
-
+from db import get_connection, get_all_users, set_user_status, delete_user, get_match_history, get_user_profile, update_user_profile, get_my_history
 HOST = "0.0.0.0"
 PORT = 5050
 
 # clients: socket -> {"name": str, "room": room_id | None}
 clients = {}
 
-# rooms: room_id -> {
-#   "players": [sock1, sock2?],
-#   "owner": str,
-#   "turn": sock | None,
-#   "ready": {sock: bool},
-#   "stage": "waiting" | "placing" | "playing" | "finished",
-#   "boards": {
-#       sock: {
-#           "ships": [...],
-#           "alive_cells": set((r, c), ...)
-#       }
-#   },
-#   "shots": {
-#       sock: set((r, c), ...)
-#   },
-#   "stats": {
-#       sock: {"shots": int, "hits": int, "misses": int}
-#   },
-#   "start_time": datetime | None,
-#   "replay_requests": set(sock, ...)
-# }
+# rooms: room_id -> { ... }
 rooms = {}
 
 lock = threading.Lock()
@@ -42,7 +21,13 @@ lock = threading.Lock()
 def send(sock, data):
     """Gửi 1 gói JSON cho 1 client."""
     try:
-        sock.sendall((json.dumps(data) + "\n").encode())
+        # Xử lý datetime để không bị lỗi JSON serialize
+        def json_serial(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            raise TypeError ("Type %s not serializable" % type(obj))
+
+        sock.sendall((json.dumps(data, default=json_serial) + "\n").encode())
     except Exception:
         pass
 
@@ -86,25 +71,15 @@ def update_names(room_id):
 
 
 def send_room_state(sock):
-    """Gửi trạng thái phòng hiện tại cho 1 client (BattleScreen mới mở)."""
+    """Gửi trạng thái phòng hiện tại cho 1 client."""
     info = clients.get(sock)
     if not info:
-        send(sock, {
-            "type": "ROOM_STATE",
-            "players": [],
-            "ready": [],
-            "stage": "none"
-        })
+        send(sock, {"type": "ROOM_STATE", "players": [], "ready": [], "stage": "none"})
         return
 
     room_id = info.get("room")
     if not room_id or room_id not in rooms:
-        send(sock, {
-            "type": "ROOM_STATE",
-            "players": [],
-            "ready": [],
-            "stage": "none"
-        })
+        send(sock, {"type": "ROOM_STATE", "players": [], "ready": [], "stage": "none"})
         return
 
     r = rooms[room_id]
@@ -124,21 +99,13 @@ def send_room_state(sock):
 
 
 # ===================== LƯU KẾT QUẢ VÀO CSDL =====================
+
 def save_match_result(room_id, winner_sock, loser_sock):
-    """
-    Lưu lịch sử trận đấu vào bảng lich_su_tran_dau
-    + cập nhật SoTranThang / SoTranThua trong bảng taikhoan.
-    """
     try:
-        if room_id not in rooms:
-            return
-
+        if room_id not in rooms: return
         r = rooms[room_id]
-        players = r.get("players", [])
-        if len(players) != 2:
-            return
-
-        p1, p2 = players
+        p1, p2 = r.get("players", [])[:2]
+        
         stats = r.get("stats", {})
         s1 = stats.get(p1, {"shots": 0, "hits": 0, "misses": 0})
         s2 = stats.get(p2, {"shots": 0, "hits": 0, "misses": 0})
@@ -149,165 +116,105 @@ def save_match_result(room_id, winner_sock, loser_sock):
         name1 = clients[p1]["name"]
         name2 = clients[p2]["name"]
 
-        # Lấy MaTaiKhoan theo TenDangNhap
-        cursor.execute(
-            "SELECT MaTaiKhoan FROM taikhoan WHERE TenDangNhap=%s", (name1,)
-        )
-        row = cursor.fetchone()
-        if not row:
-            return
-        id1 = row[0]
+        # 1. Lấy MaTaiKhoan (theo cấu trúc bảng taikhoan)
+        cursor.execute("SELECT MaTaiKhoan FROM taikhoan WHERE TenDangNhap=%s", (name1,))
+        row1 = cursor.fetchone()
+        cursor.execute("SELECT MaTaiKhoan FROM taikhoan WHERE TenDangNhap=%s", (name2,))
+        row2 = cursor.fetchone()
 
-        cursor.execute(
-            "SELECT MaTaiKhoan FROM taikhoan WHERE TenDangNhap=%s", (name2,)
-        )
-        row = cursor.fetchone()
-        if not row:
-            return
-        id2 = row[0]
+        if row1 and row2:
+            id1, id2 = row1[0], row2[0]
+            winner_id = id1 if winner_sock == p1 else id2
+            loser_id = id2 if winner_sock == p1 else id1
+            
+            start_time = r.get("start_time") or datetime.now()
+            end_time = datetime.now()
 
-        winner_name = clients[winner_sock]["name"]
-        if winner_sock == p1:
-            winner_id = id1
-        else:
-            winner_id = id2
+            # 2. Insert vào bảng lich_su_tran_dau (Đúng tên cột)
+            sql = """
+                INSERT INTO lich_su_tran_dau 
+                (MaNguoiChoi1, MaNguoiChoi2, ThoiGianBatDau, ThoiGianKetThuc, 
+                 SoLuotBan_NC1, SoLuotBan_NC2, SoLuotTrung_NC1, SoLuotTrung_NC2, NguoiThang)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            # Lưu ý: s1 tương ứng người chơi 1, s2 tương ứng người chơi 2
+            cursor.execute(sql, (
+                id1, id2, start_time, end_time, 
+                s1["shots"], s2["shots"], s1["hits"], s2["hits"], winner_id
+            ))
 
-        start_time = r.get("start_time") or datetime.now()
-        end_time = datetime.now()
-
-        # Thêm bản ghi lịch sử trận đấu
-        sql = """
-            INSERT INTO lich_su_tran_dau
-            (MaNguoiChoi1, MaNguoiChoi2,
-             ThoiGianBatDau, ThoiGianKetThuc,
-             SoLuotBan_NC1, SoLuotBan_NC2,
-             SoLuotTrung_NC1, SoLuotTrung_NC2,
-             NguoiThang)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """
-        cursor.execute(sql, (
-            id1, id2,
-            start_time, end_time,
-            s1["shots"], s2["shots"],
-            s1["hits"], s2["hits"],
-            winner_id
-        ))
-
-        # Cập nhật số trận thắng / thua
-        cursor.execute(
-            "UPDATE taikhoan SET SoTranThang = SoTranThang + 1 WHERE MaTaiKhoan=%s",
-            (winner_id,)
-        )
-        loser_id = id1 if winner_id == id2 else id2
-        cursor.execute(
-            "UPDATE taikhoan SET SoTranThua = SoTranThua + 1 WHERE MaTaiKhoan=%s",
-            (loser_id,)
-        )
-
-        db.commit()
+            # 3. Update bảng taikhoan (Đúng tên cột MaTaiKhoan)
+            cursor.execute("UPDATE taikhoan SET SoTranThang = SoTranThang + 1 WHERE MaTaiKhoan=%s", (winner_id,))
+            cursor.execute("UPDATE taikhoan SET SoTranThua = SoTranThua + 1 WHERE MaTaiKhoan=%s", (loser_id,))
+            
+            db.commit()
+            print(f"✅ Đã lưu kết quả trận đấu: {name1} vs {name2}")
 
     except Exception as e:
-        print("❗ Lỗi lưu kết quả trận đấu:", e)
+        print("❗ Lỗi lưu kết quả (server.py):", e)
     finally:
-        try:
-            if db.is_connected():
-                cursor.close()
-                db.close()
-        except Exception:
-            pass
-
+        if 'db' in locals() and db.is_connected():
+            cursor.close()
+            db.close()
 
 # ===================== LUỒNG CLIENT =====================
 def handle_client(sock):
-    """Vòng lặp lắng nghe cho từng client."""
     username = f"User{random.randint(1000, 9999)}"
     clients[sock] = {"name": username, "room": None}
-
     send(sock, {"type": "WELCOME", "username": username})
 
     buf = ""
     try:
         while True:
             data = sock.recv(4096)
-            if not data:
-                break
-
+            if not data: break
             buf += data.decode()
-
             while "\n" in buf:
                 raw, buf = buf.split("\n", 1)
-                if not raw.strip():
-                    continue
+                if not raw.strip(): continue
                 try:
                     msg = json.loads(raw)
                     process(sock, msg)
                 except Exception as e:
                     print("JSON error:", e)
-
-    except Exception:
+    except:
         pass
     finally:
         leave_room(sock)
-        if sock in clients:
-            del clients[sock]
-        # broadcast_rooms() không bắt buộc ở đây vì leave_room đã gọi
+        if sock in clients: del clients[sock]
         sock.close()
 
 
 # ===================== RỜI PHÒNG =====================
 def leave_room(sock):
     info = clients.get(sock)
-    if not info:
-        return
-
+    if not info: return
     room_id = info.get("room")
-    if not room_id or room_id not in rooms:
-        clients[sock]["room"] = None
-        return
+    if not room_id or room_id not in rooms: return
 
     with lock:
         r = rooms[room_id]
-
-        # Xóa người chơi khỏi phòng
         if sock in r["players"]:
             r["players"].remove(sock)
-
-        # Reset cho client
         clients[sock]["room"] = None
 
-        # ========= NẾU PHÒNG TRỐNG → XÓA =========
+        # Nếu phòng trống -> Xóa
         if not r["players"]:
             del rooms[room_id]
-
             print(f"🧹 Phòng {room_id} đã bị xóa")
-            print("ROOMS HIỆN TẠI:", {k: len(v['players']) for k, v in rooms.items()})
-
-            # Cập nhật lobby
             broadcast_rooms()
             return
 
-        # ========= NẾU CÒN 1 NGƯỜI =========
-        r["stage"] = "waiting"
-        r["ready"] = {}
-        r["boards"] = {}
-        r["shots"] = {}
-        r["stats"] = {}
-        r["turn"] = None
-        r["replay_requests"] = set()
-        r["start_time"] = None
-
-        remain = r["players"][0]
-
-        send(remain, {
-            "type": "CHAT",
-            "msg": "⚠ Đối thủ đã rời phòng."
+        # Nếu còn người -> Reset về waiting
+        r.update({
+            "stage": "waiting", "ready": {}, "boards": {}, 
+            "shots": {}, "stats": {}, "turn": None, 
+            "start_time": None, "replay_requests": set()
         })
-
+        
+        remain = r["players"][0]
+        send(remain, {"type": "CHAT", "msg": "⚠ Đối thủ đã rời phòng."})
         update_names(room_id)
-
-        print("ROOMS SAU KHI RỜI:", {k: len(v['players']) for k, v in rooms.items()})
-
-        # Cập nhật lobby
         broadcast_rooms()
 
 
@@ -315,379 +222,284 @@ def leave_room(sock):
 def process(sock, msg):
     t = msg.get("type")
 
-    # ---------- SET_NAME ----------
-    if t == "SET_NAME":
+    # ==================== ADMIN LOGIC ====================
+    if t == "ADMIN_GET_USERS":
+        users = get_all_users()
+        send(sock, {"type": "ADMIN_USER_LIST", "users": users})
+
+    elif t == "ADMIN_LOCK_USER":
+        target = msg.get("username")
+        status = msg.get("status") # 'Active' or 'Locked'
+        ok = set_user_status(target, status)
+        if ok:
+            users = get_all_users()
+            send(sock, {"type": "ADMIN_USER_LIST", "users": users})
+            send(sock, {"type": "ADMIN_ACTION_OK", "msg": f"Đã cập nhật trạng thái {target}"})
+        else:
+            send(sock, {"type": "ADMIN_ACTION_FAIL", "msg": "Lỗi Database!"})
+
+    elif t == "ADMIN_DELETE_USER":
+        target = msg.get("username")
+        ok = delete_user(target)
+        if ok:
+            users = get_all_users()
+            send(sock, {"type": "ADMIN_USER_LIST", "users": users})
+            send(sock, {"type": "ADMIN_ACTION_OK", "msg": f"Đã xóa {target}"})
+        else:
+            send(sock, {"type": "ADMIN_ACTION_FAIL", "msg": "Lỗi Database!"})
+
+    elif t == "ADMIN_GET_ROOMS":
+        # Lấy từ memory (RAM) vì đây là trạng thái realtime
+        room_data = []
+        for rid, r in rooms.items():
+            status = "Đang chơi" if r.get("stage") == "playing" else "Đang chờ"
+            p_names = [clients[p]["name"] for p in r["players"]]
+            room_data.append({
+                "id": rid,
+                "players": p_names,
+                "status": status
+            })
+        send(sock, {"type": "ADMIN_ROOM_LIST", "rooms": room_data})
+
+    elif t == "ADMIN_KILL_ROOM":
+        target_rid = msg.get("room_id")
+        if target_rid in rooms:
+            r = rooms[target_rid]
+            # Đuổi hết người chơi ra
+            for p in list(r["players"]): # copy list để safe remove
+                clients[p]["room"] = None
+                send(p, {"type": "ERROR", "msg": "⛔ Phòng đã bị Admin giải tán!"})
+                # Gửi gói tin để client tự quay về lobby nếu cần thiết
+                # (Ở đây ta chỉ xóa logical, client game sẽ tự xử lý khi nhận ERROR hoặc ngắt kết nối)
+            
+            del rooms[target_rid]
+            broadcast_rooms() # Cập nhật lobby cho mọi người
+            
+            # Refresh list cho Admin
+            process(sock, {"type": "ADMIN_GET_ROOMS"})
+            send(sock, {"type": "ADMIN_ACTION_OK", "msg": f"Đã hủy phòng {target_rid}"})
+
+    elif t == "ADMIN_GET_HISTORY":
+        hist = get_match_history()
+        # Convert datetime to string handled in send() function
+        send(sock, {"type": "ADMIN_HISTORY_LIST", "history": hist})
+
+
+    # ==================== GAME LOGIC ====================
+    elif t == "SET_NAME":
         name = msg.get("name", "")
         if name:
             clients[sock]["name"] = name
-            room_id = clients[sock].get("room")
-            if room_id:
-                update_names(room_id)
+            if clients[sock].get("room"): update_names(clients[sock]["room"])
 
-    # ---------- GET_ROOMS ----------
     elif t == "GET_ROOMS":
-        send(sock, {
-            "type": "ROOM_LIST",
-            "rooms": [
-                {
-                    "id": rid,
-                    "players": len(r["players"]),
-                    "owner": r.get("owner", "Unknown")
-                }
-                for rid, r in rooms.items()
-            ]
-        })
+        broadcast_rooms() # Gửi riêng cho người yêu cầu thì đúng hơn nhưng broadcast cũng ok
 
-    # ---------- CREATE_ROOM ----------
     elif t == "CREATE_ROOM":
         rid = f"R{random.randint(1000, 9999)}"
         owner = msg.get("owner", clients[sock]["name"])
-
         with lock:
             rooms[rid] = {
-                "players": [sock],
-                "owner": owner,
-                "turn": None,
-                "ready": {},
-                "stage": "waiting",
-                "boards": {},
-                "shots": {},
-                "stats": {},
-                "start_time": None,
-                "replay_requests": set()
+                "players": [sock], "owner": owner, "turn": None, "ready": {},
+                "stage": "waiting", "boards": {}, "shots": {}, "stats": {},
+                "start_time": None, "replay_requests": set()
             }
-
         clients[sock]["room"] = rid
-
-        send(sock, {
-            "type": "JOINED_ROOM",
-            "room": rid,
-            "owner": owner
-        })
-
-        # cập nhật lobby sau khi tạo phòng
+        send(sock, {"type": "JOINED_ROOM", "room": rid, "owner": owner})
         broadcast_rooms()
 
-    # ---------- JOIN_ROOM ----------
     elif t == "JOIN_ROOM":
         rid = msg.get("room")
         if rid not in rooms:
             send(sock, {"type": "ERROR", "msg": "Phòng không tồn tại!"})
             return
-
         r = rooms[rid]
         if len(r["players"]) >= 2:
             send(sock, {"type": "ERROR", "msg": "Phòng đã đầy!"})
             return
-
+        
         r["players"].append(sock)
         clients[sock]["room"] = rid
-
         send(sock, {"type": "JOINED_ROOM", "room": rid})
-
-        # đủ 2 người -> gửi START + READY_STATE
+        
         if len(r["players"]) == 2:
-            p1, p2 = r["players"]
-            name1 = clients[p1]["name"]
-            name2 = clients[p2]["name"]
-
-            r["ready"] = {p1: False, p2: False}
-            r["stage"] = "waiting"
-            r["boards"] = {}
-            r["shots"] = {}
-            r["stats"] = {}
-            r["start_time"] = None
-            r["replay_requests"] = set()
-
-            broadcast(rid, {
-                "type": "START",
-                "players": [name1, name2],
-                "ready": [False, False]
-            })
-
+            broadcast(rid, {"type": "START", "players": [clients[p]["name"] for p in r["players"]], "ready": [False, False]})
             update_names(rid)
-
-        # cập nhật lobby sau khi có người join
+        
         broadcast_rooms()
 
-    # ---------- LEAVE_ROOM (tự rời phòng nhưng vẫn online) ----------
     elif t == "LEAVE_ROOM":
         leave_room(sock)
 
-    # ---------- CHAT ----------
     elif t == "CHAT":
-        room_id = clients[sock].get("room")
-        if room_id:
-            broadcast(room_id, {
-                "type": "CHAT",
-                "msg": f"{clients[sock]['name']}: {msg.get('msg', '')}"
-            })
+        rid = clients[sock].get("room")
+        if rid: broadcast(rid, {"type": "CHAT", "msg": f"{clients[sock]['name']}: {msg.get('msg')}"})
 
-    # ---------- READY ----------
     elif t == "READY":
-        room_id = clients[sock].get("room")
-        if not room_id or room_id not in rooms:
-            return
-
-        r = rooms[room_id]
-        if "ready" not in r:
-            r["ready"] = {p: False for p in r["players"]}
-
-        r["ready"][sock] = True
-
-        players = r["players"]
-        ready_map = r["ready"]
-        player_names = [clients[p]["name"] for p in players]
-        ready_list = [bool(ready_map.get(p, False)) for p in players]
-
-        broadcast(room_id, {
-            "type": "READY_STATE",
-            "players": player_names,
-            "ready": ready_list
-        })
-
-        # Nếu cả 2 đã sẵn sàng và đang ở stage "waiting" -> sang giai đoạn đặt tàu
-        if len(players) == 2 and all(ready_list) and r.get("stage") == "waiting":
-            r["stage"] = "placing"
-            r["boards"] = {}
-            r["shots"] = {}
-            r["stats"] = {}
-            r["start_time"] = None
-
-            broadcast(room_id, {
-                "type": "PLACE_PHASE",
-                "ships": [5, 4, 3, 2]
+        rid = clients[sock].get("room")
+        if rid and rid in rooms:
+            r = rooms[rid]
+            r["ready"][sock] = True
+            broadcast(rid, {
+                "type": "READY_STATE", 
+                "players": [clients[p]["name"] for p in r["players"]],
+                "ready": [r["ready"].get(p, False) for p in r["players"]]
             })
+            # Nếu cả 2 ready
+            if len(r["players"]) == 2 and all(r["ready"].values()) and r["stage"] == "waiting":
+                r["stage"] = "placing"
+                broadcast(rid, {"type": "PLACE_PHASE", "ships": [5, 4, 3, 2]})
 
-    # ---------- GET_ROOM_STATE (Battle mới mở) ----------
     elif t == "GET_ROOM_STATE":
         send_room_state(sock)
 
-    # ---------- PLACE_DONE (gửi bố trí tàu) ----------
     elif t == "PLACE_DONE":
-        room_id = clients[sock].get("room")
-        if not room_id or room_id not in rooms:
-            return
-
-        r = rooms[room_id]
-        if r.get("stage") != "placing":
-            return
-
+        rid = clients[sock].get("room")
+        if not rid or rooms[rid]["stage"] != "placing": return
+        r = rooms[rid]
+        
+        # Xử lý ships (giống logic cũ)
         ships = msg.get("ships", [])
-        ship_list = []
         alive_cells = set()
-
         try:
             for sh in ships:
-                length = int(sh.get("len"))
-                rr = int(sh.get("r"))
-                cc = int(sh.get("c"))
-                direction = sh.get("dir", "H")
-
+                length, rr, cc, d = int(sh["len"]), int(sh["r"]), int(sh["c"]), sh.get("dir", "H")
                 cells = set()
                 for k in range(length):
-                    rcell = rr + (k if direction == "V" else 0)
-                    ccell = cc + (k if direction == "H" else 0)
-
-                    # kiểm tra trong biên 10x10
-                    if not (0 <= rcell < 10 and 0 <= ccell < 10):
-                        raise ValueError("out_of_board")
-
-                    if (rcell, ccell) in alive_cells:
-                        raise ValueError("overlap")
-
-                    cells.add((rcell, ccell))
-
-                ship_list.append({
-                    "length": length,
-                    "r": rr,
-                    "c": cc,
-                    "dir": direction,
-                    "cells": cells
-                })
+                    rc, colc = rr + (k if d=="V" else 0), cc + (k if d=="H" else 0)
+                    if not (0<=rc<10 and 0<=colc<10): raise ValueError
+                    if (rc, colc) in alive_cells: raise ValueError
+                    cells.add((rc, colc))
                 alive_cells |= cells
-
-            # lưu cho người chơi này
-            boards = r.setdefault("boards", {})
-            boards[sock] = {
-                "ships": ship_list,
-                "alive_cells": alive_cells
-            }
-
-        except Exception:
-            send(sock, {"type": "ERROR", "msg": "Bố trí tàu không hợp lệ."})
+            
+            r["boards"][sock] = {"alive_cells": alive_cells}
+        except:
+            send(sock, {"type": "ERROR", "msg": "Bố trí lỗi!"})
             return
 
-        # Nếu cả 2 người chơi đều đã gửi bố trí tàu
         if len(r["boards"]) == 2:
             r["stage"] = "playing"
             p1, p2 = r["players"]
             r["turn"] = p1
-            r["shots"] = {p1: set(), p2: set()}
-            r["stats"] = {
-                p1: {"shots": 0, "hits": 0, "misses": 0},
-                p2: {"shots": 0, "hits": 0, "misses": 0}
-            }
+            r["stats"] = {p1: {"shots":0,"hits":0,"misses":0}, p2: {"shots":0,"hits":0,"misses":0}}
             r["start_time"] = datetime.now()
-
-            broadcast(room_id, {"type": "GAME_START"})
+            broadcast(rid, {"type": "GAME_START"})
             send(p1, {"type": "TURN", "your_turn": True})
             send(p2, {"type": "TURN", "your_turn": False})
 
-    # ---------- SHOOT ----------
     elif t == "SHOOT":
-        room_id = clients[sock].get("room")
-        if not room_id or room_id not in rooms:
+        rid = clients[sock].get("room")
+        if not rid or rooms[rid]["stage"] != "playing": return
+        r = rooms[rid]
+        if r["turn"] != sock: 
+            send(sock, {"type": "ERROR", "msg": "Chưa đến lượt!"})
             return
 
-        r = rooms[room_id]
-        if r.get("stage") != "playing":
-            send(sock, {"type": "ERROR", "msg": "Trận đấu chưa bắt đầu."})
-            return
-
-        if r.get("turn") != sock:
-            send(sock, {"type": "ERROR", "msg": "Không phải lượt bạn."})
-            return
-
-        row = msg.get("r")
-        col = msg.get("c")
-
+        row, col = msg.get("r"), msg.get("c")
         players = r["players"]
-        if len(players) < 2:
-            return
-
-        enemy_sock = players[1] if players[0] == sock else players[0]
-
-        boards = r.get("boards", {})
-        enemy_board = boards.get(enemy_sock)
-        if not enemy_board:
-            return
-
-        enemy_cells = enemy_board["alive_cells"]
-
-        # Kiểm tra trúng / trượt
+        enemy = players[1] if players[0] == sock else players[0]
+        
+        enemy_cells = r["boards"][enemy]["alive_cells"]
         hit = (row, col) in enemy_cells
-        if hit:
-            enemy_cells.remove((row, col))
+        if hit: enemy_cells.remove((row, col))
 
-        # Cập nhật thống kê
-        stats = r.setdefault("stats", {}).setdefault(
-            sock, {"shots": 0, "hits": 0, "misses": 0}
-        )
-        stats["shots"] += 1
-        if hit:
-            stats["hits"] += 1
-        else:
-            stats["misses"] += 1
+        # Stats
+        st = r["stats"][sock]
+        st["shots"] += 1
+        if hit: st["hits"] += 1
+        else: st["misses"] += 1
 
-        # Thông báo cho cả phòng
-        broadcast(room_id, {
-            "type": "SHOT_RESULT",
-            "by": clients[sock]["name"],
-            "target": clients[enemy_sock]["name"],
-            "r": row,
-            "c": col,
-            "hit": hit
-        })
+        broadcast(rid, {"type": "SHOT_RESULT", "by": clients[sock]["name"], "target": clients[enemy]["name"], "r": row, "c": col, "hit": hit})
 
-        # Kiểm tra thắng (toàn bộ ô tàu đã bị bắn hết)
-        if not enemy_cells:
-            # Lưu kết quả vào CSDL
-            save_match_result(room_id, winner_sock=sock, loser_sock=enemy_sock)
-
-            broadcast(room_id, {
-                "type": "GAME_OVER",
-                "winner": clients[sock]["name"]
-            })
+        if not enemy_cells: # Thắng
+            save_match_result(rid, sock, enemy)
+            broadcast(rid, {"type": "GAME_OVER", "winner": clients[sock]["name"]})
             r["stage"] = "finished"
-            return
-
-        # Điều khiển lượt
-        if hit:
-            # bắn trúng -> ở lại lượt
-            send(sock, {"type": "TURN", "your_turn": True})
-            send(enemy_sock, {"type": "TURN", "your_turn": False})
         else:
-            # trượt -> đổi lượt
-            r["turn"] = enemy_sock
-            send(enemy_sock, {"type": "TURN", "your_turn": True})
-            send(sock, {"type": "TURN", "your_turn": False})
+            if not hit: 
+                r["turn"] = enemy
+                send(enemy, {"type": "TURN", "your_turn": True})
+                send(sock, {"type": "TURN", "your_turn": False})
+            else:
+                send(sock, {"type": "TURN", "your_turn": True})
 
-    # ---------- YÊU CẦU CHƠI LẠI ----------
     elif t == "PLAY_AGAIN":
-        room_id = clients[sock].get("room")
-        if not room_id or room_id not in rooms:
-            return
+        rid = clients[sock].get("room")
+        if rid and rooms[rid]["stage"] == "finished":
+            r = rooms[rid]
+            r["replay_requests"].add(sock)
+            players = r["players"]
+            enemy = players[1] if players[0] == sock else players[0]
+            send(enemy, {"type": "REMATCH_OFFER", "from": clients[sock]["name"]})
 
-        r = rooms[room_id]
-        if r.get("stage") != "finished":
-            send(sock, {"type": "ERROR", "msg": "Trận đấu chưa kết thúc."})
-            return
-
-        players = r["players"]
-        if len(players) < 2:
-            send(sock, {"type": "ERROR", "msg": "Không còn đối thủ trong phòng."})
-            return
-
-        enemy_sock = players[1] if players[0] == sock else players[0]
-
-        # Ghi nhận người yêu cầu chơi lại
-        rr = r.setdefault("replay_requests", set())
-        rr.add(sock)
-
-        # Gửi lời mời đến đối thủ
-        send(enemy_sock, {
-            "type": "REMATCH_OFFER",
-            "from": clients[sock]["name"]
-        })
-
-    # ---------- PHẢN HỒI CHƠI LẠI ----------
     elif t == "PLAY_AGAIN_RESPONSE":
-        room_id = clients[sock].get("room")
-        if not room_id or room_id not in rooms:
-            return
+        rid = clients[sock].get("room")
+        if rid:
+            accept = msg.get("accept")
+            if not accept:
+                leave_room(sock)
+            else:
+                r = rooms[rid]
+                r["replay_requests"].add(sock)
+                if len(r["replay_requests"]) == 2:
+                    # Reset Game
+                    r.update({"stage": "waiting", "ready": {}, "boards": {}, "stats": {}, "replay_requests": set()})
+                    p1, p2 = r["players"]
+                    r["ready"] = {p1: False, p2: False}
+                    broadcast(rid, {"type": "REMATCH_READY", "players": [clients[p1]["name"], clients[p2]["name"]]})
+    
+    # ==================== USER PROFILE & HISTORY ====================
 
-        r = rooms[room_id]
-        accept = bool(msg.get("accept"))
-        players = r["players"]
-        if len(players) < 2:
-            return
+    elif t == "GET_PROFILE":
+        username = clients[sock]["name"]
+        data = get_user_profile(username)
+        if data:
+            # Chuyển đổi ngày tháng thành chuỗi để không lỗi JSON
+            if data.get('NgayTao'): 
+                data['NgayTao'] = str(data['NgayTao'])
+            
+            if data.get('NgayCapNhat'): 
+                data['NgayCapNhat'] = str(data['NgayCapNhat'])
+            else:
+                data['NgayCapNhat'] = "Chưa cập nhật"
 
-        enemy_sock = players[1] if players[0] == sock else players[0]
+            send(sock, {"type": "PROFILE_DATA", "data": data})
 
-        if not accept:
-            # Từ chối -> báo cho đối thủ, người này rời phòng
-            send(enemy_sock, {
-                "type": "REMATCH_DENIED",
-                "by": clients[sock]["name"]
-            })
-            leave_room(sock)
-            return
+    # [Trong file server.py -> hàm process]
 
-        # Đồng ý -> nếu cả 2 đã đồng ý thì reset phòng và báo REMATCH_READY
-        rr = r.setdefault("replay_requests", set())
-        rr.add(sock)
+    elif t == "UPDATE_PROFILE":
+        old_name = clients[sock]["name"]
+        new_name = msg.get("new_username")
+        email = msg.get("email")
+        pw = msg.get("password")
+        
+        # Gọi hàm DB mới
+        ok, message = update_user_profile(old_name, new_name, email, pw)
+        
+        if ok:
+            # Cập nhật lại tên trong bộ nhớ RAM của Server
+            clients[sock]["name"] = new_name
+            # Nếu đang ở trong phòng, cần cập nhật tên cho đối thủ thấy (Optional)
+            rid = clients[sock].get("room")
+            if rid: update_names(rid)
+            
+            send(sock, {"type": "PROFILE_UPDATE_OK", "msg": message})
+        else:
+            send(sock, {"type": "ERROR", "msg": message})
 
-        if len(rr) == 2:
-            # Reset trạng thái phòng để chơi ván mới
-            r["stage"] = "waiting"
-            r["ready"] = {players[0]: False, players[1]: False}
-            r["boards"] = {}
-            r["shots"] = {}
-            r["stats"] = {}
-            r["start_time"] = None
-            r["replay_requests"] = set()
+    elif t == "DELETE_SELF":
+        username = clients[sock]["name"]
+        ok = delete_user(username) # Hàm này đã có sẵn ở bài trước
+        if ok:
+            send(sock, {"type": "DELETE_OK", "msg": "Tài khoản đã bị xóa. Tạm biệt!"})
+        else:
+            send(sock, {"type": "ERROR", "msg": "Lỗi khi xóa tài khoản!"})
 
-            broadcast(room_id, {
-                "type": "REMATCH_READY",
-                "room": room_id,
-                "players": [clients[players[0]]["name"],
-                            clients[players[1]]["name"]]
-            })
-
-    # ---------- MẶC ĐỊNH ----------
-    else:
-        send(sock, {"type": "ERROR", "msg": "Loại message không hỗ trợ."})
+    elif t == "GET_MY_HISTORY":
+        username = clients[sock]["name"]
+        hist = get_my_history(username)
+        # Datetime sẽ được json_serial xử lý ở hàm send
+        send(sock, {"type": "MY_HISTORY_DATA", "history": hist})
 
 
 # ===================== CHẠY SERVER =====================
@@ -695,13 +507,11 @@ def start():
     s = socket.socket()
     s.bind((HOST, PORT))
     s.listen()
-    print(f"SERVER RUNNING ON {HOST}:{PORT}")
+    print(f"✅ SERVER ĐANG CHẠY TẠI {HOST}:{PORT}")
 
     while True:
         client, addr = s.accept()
-        threading.Thread(target=handle_client, args=(client,),
-                         daemon=True).start()
-
+        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
 
 if __name__ == "__main__":
     start()

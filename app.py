@@ -127,7 +127,7 @@ class App(tk.Tk):
         """Cả hai đã đồng ý chơi lại – vào trận mới."""
         room = msg.get("room")
         if room:
-            self.current_room_id = room
+           self.current_room_id = room
         if not self.current_room_id:
             # phòng bị mất -> quay về sảnh
             messagebox.showinfo("Chơi lại", "Phòng không còn tồn tại.")
